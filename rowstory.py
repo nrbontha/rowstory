@@ -225,17 +225,27 @@ def escape_sql_string(value):
     return value.replace("'", "''")
 
 
+#TODO: add FKs if the foreign table exists
+def generate_create_table_statement(schema, table_name):
+    sql = f"CREATE TABLE IF NOT EXISTS {table_name} (\n"
+
+    columns = schema['columns']
+    column_definitions = []
+    for column_name, data_type in columns.items():
+        column_definitions.append(f"{column_name} {data_type}")
+
+    if schema['primary_key']:
+        column_definitions.append(f"PRIMARY KEY ({schema['primary_key']})")
+
+    sql += ",\n".join(column_definitions)
+    sql += "\n);"
+
+    return sql
+
 def generate_insert_statement(record, table_name):
-    # Extract the table name
-    table = table_name["table_name"]
-
-    # Extract column names from the schema
     columns = list(record['schema']['columns'].keys())
-
-    # Prepare the data values for the INSERT statement
     values = [record['data'][key] for key in columns if key in record['data']]
 
-    # Convert Python values to string suitable for SQL statement
     formatted_values = []
     for value in values:
         if isinstance(value, str):
@@ -245,12 +255,12 @@ def generate_insert_statement(record, table_name):
             formatted_values.append(str(value))
 
     values_str = ", ".join(formatted_values)
+    insert_statement = f"INSERT INTO {table_name} ({', '.join(columns)}) VALUES ({values_str});"
 
-    # Prepare the INSERT statement
-    insert_stmt = f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({values_str});"
-    return insert_stmt
+    return insert_statement
 
-data = purchases[1]
+
+data = customers[0]
 
 schema = client.chat.completions.create(
   model="gpt-3.5-turbo-0125",
@@ -283,29 +293,17 @@ print(insert)
 
 with db.create_connection(db_name, db_user, db_password, db_host, db_port) as connection:
     if connection:
-        connection.autocommit = False  # Important: manage transactions manually
         try:
-            # Creating a new table
-            # TODO: dynamically create CTAS statement using schema and table name
-            create_table_query = f"""
-                CREATE TABLE IF NOT EXISTS {table_name["table_name"]} (
-                    id INT,
-                    customer_id INT,
-                    item VARCHAR(255),
-                    price INT,
-                    quantity INT,
-                    date DATE
-                );
-            """
+            # Create new table if it doesn't exist
+            create_table_query = generate_create_table_statement(record["schema"], table_name["table_name"])
             db.execute_query(connection, create_table_query)
 
-            # COPY data
+            # Insert data
             with db.closing(connection.cursor()) as cursor:
-                insert_command = generate_insert_statement(record, table_name)
-                cursor.execute(insert_command)
-                connection.commit()
+                insert_query = generate_insert_statement(record, table_name["table_name"])
+                cursor.execute(insert_query)
 
-            # Reading records from the table
+            # Read records from the table
             select_query = f"SELECT * FROM {table_name['table_name']}"
             records = db.execute_read_query(connection, select_query)
             for record in records:
@@ -313,11 +311,7 @@ with db.create_connection(db_name, db_user, db_password, db_host, db_port) as co
         except Exception as e:
             print(f"An error occurred: {e}")
             connection.rollback()
-        finally:
-            connection.autocommit = True  # Reset autocommit after operations are complete
 
-# TODO: write function that creates a table name for the record/schema pair (for new table)
-# TODO: write function that creates a DDL statement to create the new table (if it doesn't exist)
 # TODO: write function that inserts the new table details in a metadata table
 #   * we need to check this table whenever we extract a new schema to see if we've seen this schema before
 #   * we also need to see if the data might fit into an existing table even if the schema isn't exactly the same as the existing one (e.g. new columns, etc.)
