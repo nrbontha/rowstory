@@ -1,3 +1,5 @@
+import hashlib
+
 from openai import OpenAI
 
 import db
@@ -135,6 +137,8 @@ loyalty = [
     }
 ]
 
+# FIXME: sometimes the generated schema uses `serial` as the PK datatype - avoid this for now
+# FIXME: sometimes the PK field is missing - if it's detected in later records, we should update the schema in the registry
 schema_generation_prompt = """
     You are tasked with generating a Postgres-compatible schema from structured data provided in formats such as JSON, CSV, or YAML. Your output should precisely follow a specified JSON structure that includes types of data fields, and optionally identifies primary and foreign keys. Here are your detailed instructions:
     
@@ -220,6 +224,23 @@ table_name_generation_prompt = """
 """
 
 
+def create_schema_registry_table():
+    sql = """
+        CREATE TABLE IF NOT EXISTS schema_registry (
+            table_name VARCHAR(255) PRIMARY KEY,
+            schema_json JSONB NOT NULL,
+            schema_hash CHAR(64) NOT NULL
+        );
+        
+        -- Create a GIN index on the schema_json column to improve JSONB operations
+        CREATE INDEX IF NOT EXISTS idx_schema_json ON schema_registry USING GIN (schema_json);
+        
+        -- Create an index on the schema_hash column for fast lookup
+        CREATE INDEX IF NOT EXISTS idx_schema_hash ON schema_registry (schema_hash);
+    """
+    return sql
+
+
 def escape_sql_string(value):
     """Escape single quotes in a string for SQL statements."""
     return value.replace("'", "''")
@@ -234,7 +255,7 @@ def generate_create_table_statement(schema, table_name):
     for column_name, data_type in columns.items():
         column_definitions.append(f"{column_name} {data_type}")
 
-    if schema['primary_key']:
+    if schema.get('primary_key'):
         column_definitions.append(f"PRIMARY KEY ({schema['primary_key']})")
 
     sql += ",\n".join(column_definitions)
@@ -260,7 +281,13 @@ def generate_insert_statement(record, table_name):
     return insert_statement
 
 
-data = customers[0]
+def hash_schema(schema):
+    canonical_schema = json.dumps(schema, sort_keys=True)
+    schema_hash = hashlib.sha256(canonical_schema.encode('utf-8')).hexdigest()
+    return schema_hash
+
+
+data = customers[1]
 
 schema = client.chat.completions.create(
   model="gpt-3.5-turbo-0125",
@@ -287,30 +314,53 @@ table_name = client.chat.completions.create(
 table_name = json.loads(table_name.choices[0].message.content)
 pprint(table_name)
 
-insert = generate_insert_statement(record, table_name)
-print(insert)
-
-
-with db.create_connection(db_name, db_user, db_password, db_host, db_port) as connection:
-    if connection:
+with db.create_connection(db_name, db_user, db_password, db_host, db_port) as cursor:
+    if cursor:
         try:
-            # Create new table if it doesn't exist
-            create_table_query = generate_create_table_statement(record["schema"], table_name["table_name"])
-            db.execute_query(connection, create_table_query)
+            schema = record["schema"]
+            table = table_name["table_name"]
 
-            # Insert data
-            with db.closing(connection.cursor()) as cursor:
-                insert_query = generate_insert_statement(record, table_name["table_name"])
-                cursor.execute(insert_query)
+            # Create schema registry if it doesn't exist
+            create_schema_registry = create_schema_registry_table()
+            db.execute_query(cursor, create_schema_registry)
 
-            # Read records from the table
-            select_query = f"SELECT * FROM {table_name['table_name']}"
-            records = db.execute_read_query(connection, select_query)
-            for record in records:
-                print(record)
+            # Check if the schema already exists
+            schema_hash = hash_schema(schema)
+            print(schema_hash)
+            select_schema_registry_query = f"SELECT table_name FROM schema_registry WHERE schema_hash = '{schema_hash}'"
+            schema_registry_record = db.execute_read_query(cursor, select_schema_registry_query)
+
+
+            # If the schema does not exist, insert it into the database
+            if not schema_registry_record:
+                schema_json = json.dumps(schema)
+                sql = f"""
+                INSERT INTO schema_registry (table_name, schema_json, schema_hash)
+                VALUES ('{table}', '{schema_json}', '{schema_hash}');
+                """
+                db.execute_query(cursor, sql)
+                print("Schema inserted successfully.")
+
+                # Create new table if it doesn't exist
+                create_table_query = generate_create_table_statement(record["schema"], table)
+                db.execute_query(cursor, create_table_query)
+                print("New table created successfully.")
+
+                # Insert data
+                insert_query = generate_insert_statement(record, table)
+                db.execute_query(cursor, insert_query)
+                print("New data inserted successfully.")
+
+            else:
+                # Insert data
+                insert_query = generate_insert_statement(record, schema_registry_record[0][0])
+                db.execute_query(cursor, insert_query)
+                print("New data inserted successfully.")
+
+
         except Exception as e:
             print(f"An error occurred: {e}")
-            connection.rollback()
+            cursor.rollback()
 
 # TODO: write function that inserts the new table details in a metadata table
 #   * we need to check this table whenever we extract a new schema to see if we've seen this schema before
@@ -329,5 +379,4 @@ with db.create_connection(db_name, db_user, db_password, db_host, db_port) as co
 
 
 # TODO: try using fine-tuned models
-
 
