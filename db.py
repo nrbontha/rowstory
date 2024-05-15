@@ -1,5 +1,4 @@
 import psycopg2
-from psycopg2 import OperationalError, connect
 from contextlib import closing
 
 def create_connection(db_name, db_user, db_password, db_host, db_port):
