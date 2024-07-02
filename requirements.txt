@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+llama-index
+mirascope
+openai
+pydantic
