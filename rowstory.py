@@ -1,6 +1,6 @@
 import os
 import shutil
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Body
 from pydantic import BaseModel, Field
 from llama_index.core import VectorStoreIndex, Document, StorageContext, load_index_from_storage
 from mirascope.core import openai, prompt_template
@@ -28,6 +28,9 @@ class DeleteIndexModel(BaseModel):
 
 class IndexSizeModel(BaseModel):
     topic: str
+
+class UpsertIndexModel(BaseModel):
+    documents: List[DocumentModel]
 
 # Retriever class
 class Retriever:
@@ -78,21 +81,21 @@ class Retriever:
 app = FastAPI()
 retriever = Retriever("./index_storage")
 
-@app.post("/update_index")
-async def update_index_endpoint(update_model: UpdateIndexModel):
+@app.put("/index/{topic}")
+async def update_index(topic: str, documents: List[DocumentModel]):
     try:
-        documents = [Document(text=doc.content, metadata=doc.metadata) for doc in update_model.documents]
-        retriever.update_index(update_model.topic, documents)
-        return {"message": f"Index for topic '{update_model.topic}' updated successfully with {len(update_model.documents)} documents"}
+        docs = [Document(text=doc.content, metadata=doc.metadata) for doc in documents]
+        retriever.update_index(topic, docs)
+        return {"message": f"Index for topic '{topic}' updated successfully with {len(documents)} documents"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/query")
-async def query_endpoint(query_model: QueryModel):
+@app.get("/index/{topic}/query")
+async def query_index(topic: str, query: str, top_k: int = 10):
     try:
-        query_result = retriever.query_index(query_model.topic, query_model.query, query_model.top_k)
+        query_result = retriever.query_index(topic, query, top_k)
         excerpts = "\n".join(query_result["results"])
-        response = generate_response(excerpts=excerpts, query=query_model.query)
+        response = generate_response(excerpts=excerpts, query=query)
         return {
             "response": response,
             "total_docs": query_result["total_docs"],
@@ -101,19 +104,28 @@ async def query_endpoint(query_model: QueryModel):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/delete_index")
-async def delete_index_endpoint(delete_model: DeleteIndexModel):
+@app.delete("/index/{topic}")
+async def delete_index(topic: str):
     try:
-        retriever.delete_index(delete_model.topic)
-        return {"message": f"Index for topic '{delete_model.topic}' deleted successfully"}
+        retriever.delete_index(topic)
+        return {"message": f"Index for topic '{topic}' deleted successfully"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/index_size")
-async def index_size_endpoint(size_model: IndexSizeModel):
+@app.get("/index/{topic}/size")
+async def index_size(topic: str):
     try:
-        size = retriever.get_index_size(size_model.topic)
-        return {"topic": size_model.topic, "size": size}
+        size = retriever.get_index_size(topic)
+        return {"topic": topic, "size": size}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/index/{topic}")
+async def upsert_index(topic: str, upsert_model: UpsertIndexModel):
+    try:
+        docs = [Document(text=doc.content, metadata=doc.metadata) for doc in upsert_model.documents]
+        retriever.update_index(topic, docs)
+        return {"message": f"Index for topic '{topic}' upserted successfully with {len(docs)} documents"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
