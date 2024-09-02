@@ -9,6 +9,7 @@ from collections import Counter, defaultdict
 from typing import List, Dict, Any
 
 import hnswlib
+import numpy as np
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from mirascope.core import openai, prompt_template
@@ -18,6 +19,185 @@ from sentence_transformers import SentenceTransformer
 # Environment variables
 os.environ["OPENAI_API_KEY"] = "your-api-key-here"  # TODO: manage this securely
 
+
+class VectorIndex(ABC):
+    @abstractmethod
+    def insert(self, documents: List[Dict[str, Any]]):
+        pass
+
+    @abstractmethod
+    def search(self, query_vector: List[float], top_k: int) -> List[Dict[str, Any]]:
+        pass
+
+    @abstractmethod
+    def delete(self):
+        pass
+
+    @abstractmethod
+    def size(self) -> int:
+        pass
+
+    @abstractmethod
+    def save(self, file_path: str):
+        pass
+
+    @abstractmethod
+    def load(self, file_path: str):
+        pass
+
+class Embedder(ABC):
+    @abstractmethod
+    def encode(self, texts: List[str]) -> List[List[float]]:
+        pass
+
+class RetrieverInterface(ABC):
+    @abstractmethod
+    def get_or_create_index(self, topic: str) -> Any:
+        pass
+
+    @abstractmethod
+    def update_index(self, topic: str, documents: List[Dict[str, Any]]):
+        pass
+
+    @abstractmethod
+    def query_index(self, topic: str, query: str, top_k: int = 10) -> Dict[str, Any]:
+        pass
+
+    @abstractmethod
+    def delete_index(self, topic: str):
+        pass
+
+    @abstractmethod
+    def get_index_size(self, topic: str) -> int:
+        pass
+
+class HNSWIndex(VectorIndex):
+    def __init__(self, dim: int, max_elements: int, ef_construction: int = 200, M: int = 16):
+        self.dim = dim
+        self.max_elements = max_elements
+        self.ef_construction = ef_construction
+        self.M = M
+        self.index = hnswlib.Index(space='cosine', dim=dim)
+        self.index.init_index(max_elements=max_elements, ef_construction=ef_construction, M=M)
+        self.documents = {}
+        self.current_id = 0
+
+    def insert(self, documents: List[Dict[str, Any]]):
+        vectors = [np.array(doc['embedding']) for doc in documents]
+        ids = list(range(self.current_id, self.current_id + len(documents)))
+        self.index.add_items(vectors, ids)
+        for i, doc in zip(ids, documents):
+            self.documents[i] = doc
+        self.current_id += len(documents)
+
+    def search(self, query_vector: List[float], top_k: int) -> List[Dict[str, Any]]:
+        labels, distances = self.index.knn_query(query_vector, k=min(top_k, len(self.documents)))
+        results = []
+        for label, distance in zip(labels[0], distances[0]):
+            doc = self.documents[label].copy()
+            doc['distance'] = float(distance)  # Convert numpy.float32 to Python float
+            results.append(doc)
+        return results
+
+    def delete(self):
+        self.index = hnswlib.Index(space='cosine', dim=self.dim)
+        self.index.init_index(max_elements=self.max_elements, ef_construction=self.ef_construction, M=self.M)
+        self.documents.clear()
+        self.current_id = 0
+
+    def size(self) -> int:
+        return len(self.documents)
+
+    def save(self, file_path: str):
+        self.index.save_index(file_path)
+        with open(file_path + '.metadata', 'wb') as f:
+            pickle.dump({
+                'documents': self.documents,
+                'current_id': self.current_id,
+                'dim': self.dim,
+                'max_elements': self.max_elements,
+                'ef_construction': self.ef_construction,
+                'M': self.M
+            }, f)
+
+    def load(self, file_path: str):
+        self.index.load_index(file_path)
+        with open(file_path + '.metadata', 'rb') as f:
+            metadata = pickle.load(f)
+        self.documents = metadata['documents']
+        self.current_id = metadata['current_id']
+        self.dim = metadata['dim']
+        self.max_elements = metadata['max_elements']
+        self.ef_construction = metadata['ef_construction']
+        self.M = metadata['M']
+
+class SentenceTransformerEmbedder(Embedder):
+    def __init__(self, model_name: str):
+        self.model = SentenceTransformer(model_name)
+
+    def encode(self, texts: List[str]) -> List[List[float]]:
+        return self.model.encode(texts).tolist()
+
+class Retriever(RetrieverInterface):
+    def __init__(self, vector_index: VectorIndex, embedder: Embedder, base_path: str):
+        self.vector_index = vector_index
+        self.embedder = embedder
+        self.base_path = base_path
+        self.indices = {}
+        os.makedirs(self.base_path, exist_ok=True)
+
+    def get_or_create_index(self, topic: str) -> VectorIndex:
+        if topic not in self.indices:
+            index_path = os.path.join(self.base_path, f"{topic}_index.bin")
+            if os.path.exists(index_path):
+                index = HNSWIndex(dim=self.vector_index.dim, max_elements=self.vector_index.max_elements)
+                index.load(index_path)
+                self.indices[topic] = index
+            else:
+                self.indices[topic] = self.vector_index.__class__(
+                    dim=self.vector_index.dim,
+                    max_elements=self.vector_index.max_elements,
+                    ef_construction=self.vector_index.ef_construction,
+                    M=self.vector_index.M
+                )
+        return self.indices[topic]
+
+    def update_index(self, topic: str, documents: List[Dict[str, Any]]):
+        index = self.get_or_create_index(topic)
+        contents = [doc['content'] for doc in documents]
+        embeddings = self.embedder.encode(contents)
+        for doc, embedding in zip(documents, embeddings):
+            doc['embedding'] = embedding
+        index.insert(documents)
+        self._save_index(topic)
+
+    def query_index(self, topic: str, query: str, top_k: int = 10) -> Dict[str, Any]:
+        index = self.get_or_create_index(topic)
+        query_vector = self.embedder.encode([query])[0]
+        results = index.search(query_vector, top_k)
+        return {
+            "results": results,
+            "total_docs": self.get_index_size(topic),
+            "returned_docs": len(results)
+        }
+
+    def delete_index(self, topic: str):
+        if topic in self.indices:
+            self.indices[topic].delete()
+            del self.indices[topic]
+            index_path = os.path.join(self.base_path, f"{topic}_index.bin")
+            if os.path.exists(index_path):
+                os.remove(index_path)
+            if os.path.exists(index_path + '.metadata'):
+                os.remove(index_path + '.metadata')
+
+    def get_index_size(self, topic: str) -> int:
+        index = self.get_or_create_index(topic)
+        return index.size()
+
+    def _save_index(self, topic: str):
+        index_path = os.path.join(self.base_path, f"{topic}_index.bin")
+        self.indices[topic].save(index_path)
 
 class DocumentModel(BaseModel):
     content: str
@@ -30,197 +210,18 @@ class QueryModel(BaseModel):
     query: str
     top_k: int = 10
 
-
-class RetrieverInterface(ABC):
-    @abstractmethod
-    def get_or_create_index(self, topic: str) -> Any:
-        pass
-
-    @abstractmethod
-    def update_index(self, topic: str, documents: List[DocumentModel]):
-        pass
-
-    @abstractmethod
-    def query_index(self, topic: str, query: str, top_k: int = 10) -> Dict[str, Any]:
-        pass
-
-    @abstractmethod
-    def delete_index(self, topic: str):
-        pass
-
-    @abstractmethod
-    def get_index_size(self, topic: str) -> int:
-        pass
-
-
-class HNSWRetriever(RetrieverInterface):
-    def __init__(self, base_storage_path: str):
-        self.base_storage_path = base_storage_path
-        os.makedirs(self.base_storage_path, exist_ok=True)
-        self.indices = {}
-        self.embedder = SentenceTransformer('all-MiniLM-L6-v2')
-        self.dim = 384  # Dimension of the embeddings
-        self.key_frequency = Counter()
-        self.key_value_index = defaultdict(lambda: defaultdict(set))
-        self.ef_search = 50
-
-    def get_or_create_index(self, topic: str) -> hnswlib.Index:
-        if topic not in self.indices:
-            index_path = os.path.join(self.base_storage_path, f"{topic}_index.bin")
-            if os.path.exists(index_path):
-                index = hnswlib.Index(space='cosine', dim=self.dim)
-                index.load_index(index_path)
-            else:
-                index = hnswlib.Index(space='cosine', dim=self.dim)
-                index.init_index(max_elements=100000, ef_construction=200, M=16)
-            self.indices[topic] = index
-        return self.indices[topic]
-
-    def update_index(self, topic: str, documents: List[DocumentModel]):
-        index = self.get_or_create_index(topic)
-        contents = [doc.content for doc in documents]
-        embeddings = self.embedder.encode(contents)
-        
-        current_size = index.get_current_count()
-        index.add_items(embeddings, list(range(current_size, current_size + len(embeddings))))
-
-        metadata_path = os.path.join(self.base_storage_path, f"{topic}_metadata.pkl")
-        metadata = self.load_metadata(topic)
-        for i, doc in enumerate(documents):
-            doc_data = doc.model_dump()
-            generated_metadata = self.generate_metadata(doc_data['content'])
-            doc_data['metadata'] = generated_metadata
-            doc_id = current_size + i
-            metadata[doc_id] = doc_data
-            self.update_key_frequency(generated_metadata)
-            self.update_key_value_index(doc_id, generated_metadata)
-        with open(metadata_path, 'wb') as f:
-            pickle.dump(metadata, f)
-
-        index_path = os.path.join(self.base_storage_path, f"{topic}_index.bin")
-        index.save_index(index_path)
-
-    def query_index(self, topic: str, query: str, top_k: int = 10) -> Dict[str, Any]:
-        try:
-            index = self.get_or_create_index(topic)
-            query_vector = self.embedder.encode([query])[0]
-
-            max_ef_search = 200
-            while self.ef_search <= max_ef_search:
-                try:
-                    index.set_ef(self.ef_search)
-                    labels, distances = index.knn_query(query_vector, k=min(top_k, index.get_current_count()))
-                    break
-                except RuntimeError:
-                    self.ef_search *= 2
-                    if self.ef_search > max_ef_search:
-                        raise HTTPException(status_code=500, detail="Unable to perform the query. The index might be empty or the query parameters are unsuitable.")
-
-            metadata = self.load_metadata(topic)
-            results = [metadata[label] for label in labels[0] if label in metadata]
-            related_data = self.gather_related_data(metadata, results)
-            
-            return {
-                "results": related_data,
-                "total_docs": index.get_current_count(),
-                "returned_docs": len(related_data)
-            }
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
-
-    def delete_index(self, topic: str):
-        if topic in self.indices:
-            del self.indices[topic]
-        
-        index_path = os.path.join(self.base_storage_path, f"{topic}_index.bin")
-        metadata_path = os.path.join(self.base_storage_path, f"{topic}_metadata.pkl")
-        
-        if os.path.exists(index_path):
-            os.remove(index_path)
-        if os.path.exists(metadata_path):
-            os.remove(metadata_path)
-
-    def get_index_size(self, topic: str) -> int:
-        index = self.get_or_create_index(topic)
-        return index.get_current_count()
-
-    def generate_metadata(self, content: str) -> Dict[str, Any]:
-        metadata = {}
-        metadata['id'] = hashlib.md5(content.encode()).hexdigest()
-        key_value_pairs = re.findall(r'(\w+)[:\s]+(\S+)', content)
-        for key, value in key_value_pairs:
-            metadata[key.lower()] = value.rstrip(',')
-        return metadata
-
-    def update_key_frequency(self, metadata: Dict[str, Any]):
-        for key in metadata.keys():
-            self.key_frequency[key] += 1
-
-    def update_key_value_index(self, doc_id: int, metadata: Dict[str, Any]):
-        for key, value in metadata.items():
-            self.key_value_index[key][value].add(doc_id)
-
-    def get_potential_keys(self, threshold: int = 5) -> List[str]:
-        return [key for key, count in self.key_frequency.items() if count >= threshold]
-
-    def gather_related_data(self, metadata: Dict[int, Dict], results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        Discover and collect documents related to the initial query results.
-        This method performs a depth-first search to find documents that share common
-        metadata values with the initial results. It builds a network of related
-        information based on shared attributes.
-        Args:
-            metadata (Dict[int, Dict]): Map of all document metadata, keyed by document ID.
-            results (List[Dict[str, Any]]): The initial list of documents returned by the query.
-        Returns:
-            List[Dict[str, Any]]: List of related documents.
-        """
-        related_data = []
-        explored_docs = set()
-        potential_keys = self.get_potential_keys()
-        
-        def explore_document(doc):
-            if not isinstance(doc, dict):
-                return
-            
-            doc_id = doc['metadata'].get('id')
-            if doc_id is None or doc_id in explored_docs:
-                return
-            
-            explored_docs.add(doc_id)
-            related_data.append(doc)
-            
-            for key in potential_keys:
-                if key in doc['metadata']:
-                    value = doc['metadata'][key]
-                    related_docs = [
-                        metadata[id] for id in metadata
-                        if metadata[id]['metadata'].get(key) == value and metadata[id]['metadata'].get('id') not in explored_docs
-                    ]
-                    for related_doc in related_docs:
-                        explore_document(related_doc)
-
-        for result in results:
-            explore_document(result)
-        
-        return related_data
-
-    def load_metadata(self, topic: str) -> Dict[int, Dict]:
-        metadata_path = os.path.join(self.base_storage_path, f"{topic}_metadata.pkl")
-        if os.path.exists(metadata_path):
-            with open(metadata_path, 'rb') as f:
-                return pickle.load(f)
-        return {}
-
-# FastAPI app and routes
 app = FastAPI()
-retriever = HNSWRetriever("./hnsw_index_storage")
+
+vector_index = HNSWIndex(dim=384, max_elements=100000)
+embedder = SentenceTransformerEmbedder('all-MiniLM-L6-v2')
+retriever = Retriever(vector_index, embedder, base_path="./index_storage")
 
 @app.post("/index/{topic}")
 async def upsert_index(topic: str, upsert_model: UpsertIndexModel):
     try:
-        retriever.update_index(topic, upsert_model.documents)
-        return {"message": f"Index for topic '{topic}' upserted successfully with {len(upsert_model.documents)} documents"}
+        documents = [doc.model_dump() for doc in upsert_model.documents]
+        retriever.update_index(topic, documents)
+        return {"message": f"Index for topic '{topic}' upserted successfully with {len(documents)} documents"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -234,6 +235,7 @@ async def query_index(topic: str, query: str, top_k: int = 10):
         
         excerpts = "\n".join([doc.get("content", "") for doc in result["results"]])
         response = generate_response(excerpts=excerpts, query=query)
+        
         return {
             "response": response,
             "total_docs": result["total_docs"],
@@ -253,8 +255,8 @@ async def delete_index(topic: str):
 @app.get("/index/{topic}/size")
 async def index_size(topic: str):
     try:
-        hnsw_size = retriever.get_index_size(topic)
-        return {"topic": topic, "hnsw_size": hnsw_size}
+        size = retriever.get_index_size(topic)
+        return {"topic": topic, "size": size}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
