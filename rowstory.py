@@ -138,8 +138,8 @@ class SentenceTransformerEmbedder(Embedder):
     def encode(self, texts: List[str]) -> List[List[float]]:
         return self.model.encode(texts).tolist()
 
-class Retriever(RetrieverInterface):
-    def __init__(self, vector_index: VectorIndex, embedder: Embedder, base_path: str):
+class HNSWRetriever(RetrieverInterface):
+    def __init__(self, vector_index: HNSWIndex, embedder: Embedder, base_path: str):
         self.vector_index = vector_index
         self.embedder = embedder
         self.base_path = base_path
@@ -214,7 +214,7 @@ app = FastAPI()
 
 vector_index = HNSWIndex(dim=384, max_elements=100000)
 embedder = SentenceTransformerEmbedder('all-MiniLM-L6-v2')
-retriever = Retriever(vector_index, embedder, base_path="./index_storage")
+retriever = HNSWRetriever(vector_index, embedder, base_path="./index_storage")
 
 @app.post("/index/{topic}")
 async def upsert_index(topic: str, upsert_model: UpsertIndexModel):
