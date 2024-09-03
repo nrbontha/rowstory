@@ -4,3 +4,7 @@ llama-index
 mirascope
 openai
 pydantic
+hnswlib
+sentence-transformers
+psycopg2-binary
+pgvector

@@ -4,6 +4,9 @@ from datetime import datetime, timedelta
 import numpy as np
 from typing import List, Dict, Any, Tuple
 from abc import ABC, abstractmethod
+import psycopg2
+from psycopg2.extras import execute_values
+from pgvector.psycopg2 import register_vector
 
 class StorageBackend(ABC):
     @abstractmethod
@@ -50,6 +53,56 @@ class LMDBStorage(StorageBackend):
     def delete_bucket(self, key):
         with self.env.begin(write=True) as txn:
             txn.delete(key.encode())
+
+class PgVectorStorage(StorageBackend):
+    def __init__(self, connection_string):
+        self.conn = psycopg2.connect(connection_string)
+        register_vector(self.conn)
+        self._create_table()
+
+    def _create_table(self):
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS streamhouse_buckets (
+                    key TEXT PRIMARY KEY,
+                    vectors VECTOR[],
+                    metadata JSONB
+                )
+            """)
+        self.conn.commit()
+
+    def save_bucket(self, key, vectors, metadata):
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO streamhouse_buckets (key, vectors, metadata)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (key) DO UPDATE
+                SET vectors = EXCLUDED.vectors, metadata = EXCLUDED.metadata
+            """, (key, vectors.tolist(), json.dumps(metadata)))
+        self.conn.commit()
+
+    def load_bucket(self, key):
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT vectors, metadata FROM streamhouse_buckets WHERE key = %s", (key,))
+            result = cur.fetchone()
+            if result:
+                return np.array(result[0]), json.loads(result[1])
+            return np.empty((0, self.dim)), []
+
+    def bucket_exists(self, key):
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM streamhouse_buckets WHERE key = %s", (key,))
+            return cur.fetchone() is not None
+
+    def list_buckets(self):
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT key FROM streamhouse_buckets")
+            return [row[0] for row in cur.fetchall()]
+
+    def delete_bucket(self, key):
+        with self.conn.cursor() as cur:
+            cur.execute("DELETE FROM streamhouse_buckets WHERE key = %s", (key,))
+        self.conn.commit()
 
 class Streamhouse:
     def __init__(self, storage_backend: StorageBackend, dim: int = 128, bucket_size: timedelta = timedelta(hours=1)):
@@ -109,7 +162,8 @@ class Streamhouse:
 
 # Usage example
 if __name__ == "__main__":
-    storage = LMDBStorage("/tmp/streamhouse_db")
+    # Use PgVectorStorage instead of LMDBStorage
+    storage = PgVectorStorage("postgresql://user:password@localhost/dbname")
     sh = Streamhouse(storage)
 
     # Insert some time series data
